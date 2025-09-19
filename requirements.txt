@@ -6,3 +6,6 @@ pillow
 pytesseract
 numpy
 transformers
+torch
+sentence-transformers
+scikit-learn
