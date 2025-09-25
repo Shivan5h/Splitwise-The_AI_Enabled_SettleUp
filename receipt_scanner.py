@@ -35,7 +35,7 @@ class ReceiptScanner:
         
     @staticmethod
     def parse_receipt(text):
-        total_pattertotal_patterns = [
+        total_patterns = [
             r'total[\s:]*[\$]?(\d+\.\d{2})',
             r'amount[\s:]*[\$]?(\d+\.\d{2})',
             r'balance[\s:]*[\$]?(\d+\.\d{2})',

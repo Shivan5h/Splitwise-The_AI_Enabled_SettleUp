@@ -9,3 +9,6 @@ transformers
 torch
 sentence-transformers
 scikit-learn
+streamlit
+pandas
+requests

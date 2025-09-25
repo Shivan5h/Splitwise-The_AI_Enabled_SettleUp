@@ -1,9 +1,11 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 import logging
+import os
+from receipt_scanner import ReceiptScanner
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -108,6 +110,14 @@ class SettlementResult(BaseModel):
     group_id: str
     balances: Dict[str, float]
     optimal_settlements: List[Debt]
+
+class ReceiptScanResult(BaseModel):
+    total_amount: Optional[float]
+    date: str
+    vendor: str
+    raw_text: str
+    success: bool
+    message: str
 
 # ===== SETTLEMENT OPTIMIZER =====
 class SettlementOptimizer:
@@ -417,6 +427,119 @@ async def get_user_summary(user_id: str):
         "net_balance": total_owed - total_owes,
         "recent_expenses": recent_expenses
     }
+
+@app.post("/scan-receipt/", response_model=ReceiptScanResult)
+async def scan_receipt_from_image():
+    """Scan receipt from image.jpg file in the current directory"""
+    try:
+        # Path to the image.jpg file
+        image_path = "image.jpg"
+        
+        # Check if the file exists
+        if not os.path.exists(image_path):
+            raise HTTPException(status_code=404, detail="image.jpg file not found in the current directory")
+        
+        # Read the image file
+        with open(image_path, "rb") as image_file:
+            image_data = image_file.read()
+        
+        # Scan the receipt
+        receipt_data = ReceiptScanner.scan_receipt(image_data)
+        
+        return {
+            "total_amount": receipt_data.get("total_amount"),
+            "date": receipt_data.get("date", ""),
+            "vendor": receipt_data.get("vendor", "Unknown Vendor"),
+            "raw_text": receipt_data.get("raw_text", ""),
+            "success": True,
+            "message": "Receipt scanned successfully"
+        }
+        
+    except Exception as e:
+        logger.error(f"Error scanning receipt: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error scanning receipt: {str(e)}")
+
+@app.post("/scan-receipt-create-expense/", response_model=dict)
+async def scan_receipt_and_create_expense(
+    paid_by: str,
+    split_between: List[str],
+    group_id: Optional[str] = None,
+    category: Optional[str] = None
+):
+    """Scan receipt from image.jpg and automatically create an expense"""
+    try:
+        # First scan the receipt
+        image_path = "image.jpg"
+        
+        if not os.path.exists(image_path):
+            raise HTTPException(status_code=404, detail="image.jpg file not found in the current directory")
+        
+        with open(image_path, "rb") as image_file:
+            image_data = image_file.read()
+        
+        receipt_data = ReceiptScanner.scan_receipt(image_data)
+        
+        if receipt_data.get("total_amount") is None:
+            raise HTTPException(status_code=400, detail="Could not extract total amount from receipt")
+        
+        # Create expense from receipt data
+        expense_data = ExpenseCreate(
+            description=f"Receipt from {receipt_data.get('vendor', 'Unknown Vendor')}",
+            amount=receipt_data["total_amount"],
+            paid_by=paid_by,
+            split_between=split_between,
+            category=category or "Miscellaneous",
+            group_id=group_id
+        )
+        
+        # Validate that paid_by user exists
+        if paid_by not in users_db:
+            raise HTTPException(status_code=400, detail=f"User {paid_by} does not exist")
+        
+        # Validate that all split_between users exist
+        for user_id in split_between:
+            if user_id not in users_db:
+                raise HTTPException(status_code=400, detail=f"User {user_id} does not exist")
+        
+        # Validate that group exists if provided
+        if group_id and group_id not in groups_db:
+            raise HTTPException(status_code=400, detail=f"Group {group_id} does not exist")
+        
+        expense_id = str(len(expenses_db) + 1)
+        
+        expenses_db[expense_id] = {
+            "id": expense_id,
+            **expense_data.dict(),
+            "created_at": datetime.now().isoformat()
+        }
+        
+        # Calculate debts
+        amount_per_person = expense_data.amount / len(expense_data.split_between)
+        for debtor in expense_data.split_between:
+            if debtor != expense_data.paid_by:
+                debt_id = f"{expense_id}_{debtor}"
+                debts_db[debt_id] = {
+                    "debtor": debtor,
+                    "creditor": expense_data.paid_by,
+                    "amount": amount_per_person,
+                    "expense_id": expense_id,
+                    "group_id": expense_data.group_id,
+                    "created_at": datetime.now().isoformat(),
+                    "status": "pending"
+                }
+        
+        return {
+            "success": True,
+            "message": "Receipt scanned and expense created successfully",
+            "receipt_data": receipt_data,
+            "expense": expenses_db[expense_id]
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error scanning receipt and creating expense: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error processing receipt: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
