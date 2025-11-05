@@ -1,546 +1,366 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict
 from datetime import datetime
 import logging
+import json
 import os
-from receipt_scanner import ReceiptScanner
+import uvicorn
 
-# Configure logging
+from receipt_scanner import ReceiptScanner
+from expense_categorizer import ExpenseCategorizer  
+from settlement_optimizer import SettlementOptimizer
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
-    title="Expense Sharing API",
-    description="A Simple Expense Management System for Groups",
-    version="1.0.0"
+    title="Splitwise AI - Expense Sharing API",
+    description="Scan → Categorize → Optimize Settlement",
+    version="2.0.0"
 )
 
-# CORS middleware to allow frontend connections
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Mock database (in production, use a real database)
-users_db = {}
+# In-memory storage
 groups_db = {}
 expenses_db = {}
-debts_db = {}
-reminders_db = {}
+users_db = {}
 
-# ===== DATA MODELS =====
-class UserCreate(BaseModel):
-    name: str = Field(..., description="Full name of the user")
-    email: str = Field(..., description="Email address of the user")
-    phone: Optional[str] = Field(None, description="Phone number of the user")
+# Initialize AI categorizer
+try:
+    expense_categorizer = ExpenseCategorizer(use_llm=True)
+    logger.info("AI categorizer loaded")
+except Exception as e:
+    expense_categorizer = ExpenseCategorizer(use_llm=False) 
+    logger.warning(f"Using rule-based categorizer: {e}")
 
-class UserResponse(BaseModel):
-    id: str
-    name: str
-    email: str
-    phone: Optional[str]
-    created_at: str
+# Data models
+class User(BaseModel):
+    id: str = Field(..., example="user_123")
+    name: str = Field(..., example="John Doe")
+    email: str = Field(..., example="john@email.com")
 
 class GroupCreate(BaseModel):
-    name: str = Field(..., description="Name of the group")
-    member_ids: List[str] = Field(..., description="List of user IDs in the group")
-    type: Optional[str] = Field("general", description="Type of group: roommates, travel, friends, family, work, sports")
+    name: str = Field(..., example="Trip to Goa")
+    members: List[User]
 
-class GroupResponse(BaseModel):
-    id: str
-    name: str
-    members: List[str]
-    type: str
-    created_at: str
-
-class ExpenseCreate(BaseModel):
-    description: str = Field(..., description="Description of the expense")
-    amount: float = Field(..., gt=0, description="Amount of the expense")
-    paid_by: str = Field(..., description="ID of user who paid the expense")
-    split_between: List[str] = Field(..., description="List of user IDs between whom the expense is split")
-    category: Optional[str] = Field(None, description="Category of the expense")
-    group_id: Optional[str] = Field(None, description="ID of the group this expense belongs to")
-
-class ExpenseResponse(BaseModel):
-    id: str
-    description: str
-    amount: float
-    paid_by: str
-    split_between: List[str]
-    category: str
-    group_id: Optional[str]
-    created_at: str
-
-class Debt(BaseModel):
-    debtor: str
-    creditor: str
-    amount: float
-    expense_id: Optional[str] = None
-    status: str = "pending"
-
-class DebtResponse(BaseModel):
-    debtor: str
-    creditor: str
-    amount: float
-    expense_id: Optional[str]
-    status: str
-    created_at: str
-
-class Reminder(BaseModel):
-    debtor: str
-    creditor: str
-    amount: float
-    message: str
-    status: str = "generated"
-
-class ReminderResponse(BaseModel):
-    id: str
-    debtor: str
-    creditor: str
-    amount: float
-    message: str
-    status: str
-    created_at: str
-
-class SettlementResult(BaseModel):
-    group_id: str
-    balances: Dict[str, float]
-    optimal_settlements: List[Debt]
-
-class ReceiptScanResult(BaseModel):
-    total_amount: Optional[float]
-    date: str
-    vendor: str
-    raw_text: str
+class ApiResponse(BaseModel):
     success: bool
     message: str
+    data: Optional[Dict] = None
 
-# ===== SETTLEMENT OPTIMIZER =====
-class SettlementOptimizer:
-    @staticmethod
-    def calculate_balances(expenses):
-        """Calculate net balance for each user"""
-        balances = {}
-        
-        for expense in expenses:
-            payer = expense["paid_by"]
-            amount = expense["amount"]
-            split_count = len(expense["split_between"])
-            share = amount / split_count if split_count > 0 else 0
-            
-            # Update payer's balance
-            balances[payer] = balances.get(payer, 0) + amount
-            
-            # Update beneficiaries' balances
-            for user_id in expense["split_between"]:
-                balances[user_id] = balances.get(user_id, 0) - share
-        
-        return balances
-
-    @staticmethod
-    def minimize_transactions(balances):
-        """Optimize settlements to minimize number of transactions"""
-        debts = []
-        
-        # Convert balances to list of debts
-        creditors = []
-        debtors = []
-        
-        for user_id, balance in balances.items():
-            if balance > 0:
-                creditors.append((user_id, balance))
-            elif balance < 0:
-                debtors.append((user_id, -balance))
-        
-        # Sort creditors and debtors
-        creditors.sort(key=lambda x: x[1], reverse=True)
-        debtors.sort(key=lambda x: x[1], reverse=True)
-        
-        # Distribute debts
-        i = j = 0
-        while i < len(creditors) and j < len(debtors):
-            creditor, cred_amt = creditors[i]
-            debtor, deb_amt = debtors[j]
-            
-            settlement_amt = min(cred_amt, deb_amt)
-            debts.append({
-                "from": debtor,
-                "to": creditor,
-                "amount": round(settlement_amt, 2)
-            })
-            
-            creditors[i] = (creditor, cred_amt - settlement_amt)
-            debtors[j] = (debtor, deb_amt - settlement_amt)
-            
-            if creditors[i][1] < 0.01:  # Floating point tolerance
-                i += 1
-            if debtors[j][1] < 0.01:    # Floating point tolerance
-                j += 1
-        
-        return debts
-
-    @staticmethod
-    def optimize_settlements(expenses):
-        """Main method to calculate optimal settlements"""
-        balances = SettlementOptimizer.calculate_balances(expenses)
-        settlements = SettlementOptimizer.minimize_transactions(balances)
-        
-        return {
-            "balances": balances,
-            "optimal_settlements": settlements
-        }
-
-# ===== API ENDPOINTS =====
-@app.get("/")
-async def root():
-    return {"message": "Expense Sharing System API"}
-
-@app.post("/users/", response_model=UserResponse)
-async def create_user(user: UserCreate):
-    """Create a new user"""
-    user_id = str(len(users_db) + 1)
-    users_db[user_id] = {
-        "id": user_id,
-        **user.dict(),
-        "created_at": datetime.now().isoformat()
-    }
-    return users_db[user_id]
-
-@app.get("/users/{user_id}", response_model=UserResponse)
-async def get_user(user_id: str):
-    """Get user details"""
-    if user_id not in users_db:
-        raise HTTPException(status_code=404, detail="User not found")
-    return users_db[user_id]
-
-@app.get("/users/", response_model=Dict[str, UserResponse])
-async def list_users():
-    """List all users"""
-    return users_db
-
-@app.post("/groups/", response_model=GroupResponse)
-async def create_group(group: GroupCreate):
-    """Create a new group"""
-    # Validate that all member IDs exist
-    for member_id in group.member_ids:
-        if member_id not in users_db:
-            raise HTTPException(status_code=400, detail=f"User {member_id} does not exist")
-    
-    group_id = str(len(groups_db) + 1)
-    groups_db[group_id] = {
-        "id": group_id,
-        "name": group.name,
-        "members": group.member_ids,
-        "type": group.type,
-        "created_at": datetime.now().isoformat()
-    }
-    return groups_db[group_id]
-
-@app.get("/groups/{group_id}", response_model=GroupResponse)
-async def get_group(group_id: str):
-    """Get group details"""
-    if group_id not in groups_db:
-        raise HTTPException(status_code=404, detail="Group not found")
-    return groups_db[group_id]
-
-@app.get("/groups/", response_model=Dict[str, GroupResponse])
-async def list_groups():
-    """List all groups"""
-    return groups_db
-
-@app.patch("/groups/{group_id}", response_model=GroupResponse)
-async def update_group_type(group_id: str, group_type: str):
-    """Update the type of a group"""
-    if group_id not in groups_db:
-        raise HTTPException(status_code=404, detail="Group not found")
-    
-    groups_db[group_id]["type"] = group_type
-    
-    return groups_db[group_id]
-
-@app.post("/expenses/", response_model=ExpenseResponse)
-async def create_expense(expense: ExpenseCreate):
-    """Create a new expense"""
-    # Validate that paid_by user exists
-    if expense.paid_by not in users_db:
-        raise HTTPException(status_code=400, detail=f"User {expense.paid_by} does not exist")
-    
-    # Validate that all split_between users exist
-    for user_id in expense.split_between:
-        if user_id not in users_db:
-            raise HTTPException(status_code=400, detail=f"User {user_id} does not exist")
-    
-    # Validate that group exists if provided
-    if expense.group_id and expense.group_id not in groups_db:
-        raise HTTPException(status_code=400, detail=f"Group {expense.group_id} does not exist")
-    
-    expense_id = str(len(expenses_db) + 1)
-    
-    # Use default category if not provided
-    category = expense.category or "Miscellaneous"
-    
-    expenses_db[expense_id] = {
-        "id": expense_id,
-        **expense.dict(),
-        "category": category,
-        "created_at": datetime.now().isoformat()
-    }
-    
-    # Calculate debts
-    amount_per_person = expense.amount / len(expense.split_between)
-    for debtor in expense.split_between:
-        if debtor != expense.paid_by:
-            debt_id = f"{expense_id}_{debtor}"
-            debts_db[debt_id] = {
-                "debtor": debtor,
-                "creditor": expense.paid_by,
-                "amount": amount_per_person,
-                "expense_id": expense_id,
-                "group_id": expense.group_id,
-                "created_at": datetime.now().isoformat(),
-                "status": "pending"
-            }
-    
-    return expenses_db[expense_id]
-
-@app.get("/expenses/{expense_id}", response_model=ExpenseResponse)
-async def get_expense(expense_id: str):
-    """Get expense details"""
-    if expense_id not in expenses_db:
-        raise HTTPException(status_code=404, detail="Expense not found")
-    return expenses_db[expense_id]
-
-@app.get("/expenses/", response_model=Dict[str, ExpenseResponse])
-async def list_expenses(group_id: Optional[str] = None):
-    """List all expenses, optionally filtered by group"""
-    if group_id:
-        return {eid: expense for eid, expense in expenses_db.items() if expense.get("group_id") == group_id}
-    return expenses_db
-
-@app.get("/groups/{group_id}/settlements", response_model=SettlementResult)
-async def calculate_settlements(group_id: str):
-    """Calculate optimal settlements for a group"""
-    if group_id not in groups_db:
-        raise HTTPException(status_code=404, detail="Group not found")
-    
-    # Get all expenses for this group
-    group_expenses = [
-        expense for expense in expenses_db.values() 
-        if expense.get("group_id") == group_id
-    ]
-    
-    # Calculate optimal settlements
-    settlement_data = SettlementOptimizer.optimize_settlements(group_expenses)
-    
-    return {
-        "group_id": group_id,
-        **settlement_data
-    }
-
-@app.get("/groups/{group_id}/spending", response_model=dict)
-async def get_group_spending(group_id: str):
-    """Get spending breakdown by category for a specific group"""
-    if group_id not in groups_db:
-        raise HTTPException(status_code=404, detail="Group not found")
-    
-    # Get all expenses for this group
-    group_expenses = [
-        expense for expense in expenses_db.values() 
-        if expense.get("group_id") == group_id
-    ]
-    
-    # Calculate spending by category
-    spending_by_category = {}
-    for expense in group_expenses:
-        category = expense.get("category", "Miscellaneous")
-        amount = expense.get("amount", 0)
-        spending_by_category[category] = spending_by_category.get(category, 0) + amount
-    
-    return {
-        "group_id": group_id,
-        "spending_by_category": spending_by_category,
-        "total_spent": sum(spending_by_category.values())
-    }
-
-@app.get("/debts/", response_model=Dict[str, DebtResponse])
-async def list_debts(user_id: Optional[str] = None, group_id: Optional[str] = None):
-    """List all debts, optionally filtered by user or group"""
-    filtered_debts = {}
-    
-    for debt_id, debt in debts_db.items():
-        # Filter by user if specified
-        if user_id and debt["debtor"] != user_id and debt["creditor"] != user_id:
-            continue
-        
-        # Filter by group if specified
-        if group_id and debt.get("group_id") != group_id:
-            continue
-            
-        filtered_debts[debt_id] = debt
-    
-    return filtered_debts
-
-@app.post("/debts/{debt_id}/settle", response_model=DebtResponse)
-async def settle_debt(debt_id: str):
-    """Mark a debt as settled"""
-    if debt_id not in debts_db:
-        raise HTTPException(status_code=404, detail="Debt not found")
-    
-    debts_db[debt_id]["status"] = "settled"
-    debts_db[debt_id]["settled_at"] = datetime.now().isoformat()
-    
-    return debts_db[debt_id]
-
-@app.get("/user/{user_id}/summary", response_model=dict)
-async def get_user_summary(user_id: str):
-    """Get a summary of a user's financial situation"""
-    if user_id not in users_db:
-        raise HTTPException(status_code=404, detail="User not found")
-    
-    # Calculate total owed to user
-    total_owed = sum(
-        debt["amount"] for debt in debts_db.values() 
-        if debt["creditor"] == user_id and debt["status"] == "pending"
-    )
-    
-    # Calculate total user owes
-    total_owes = sum(
-        debt["amount"] for debt in debts_db.values() 
-        if debt["debtor"] == user_id and debt["status"] == "pending"
-    )
-    
-    # Get recent expenses
-    user_expenses = [
-        expense for expense in expenses_db.values() 
-        if expense["paid_by"] == user_id
-    ]
-    recent_expenses = sorted(user_expenses, key=lambda x: x["created_at"], reverse=True)[:5]
-    
-    return {
-        "user_id": user_id,
-        "total_owed_to_you": total_owed,
-        "total_you_owe": total_owes,
-        "net_balance": total_owed - total_owes,
-        "recent_expenses": recent_expenses
-    }
-
-@app.post("/scan-receipt/", response_model=ReceiptScanResult)
-async def scan_receipt_from_image():
-    """Scan receipt from image.jpg file in the current directory"""
-    try:
-        # Path to the image.jpg file
-        image_path = "image.jpg"
-        
-        # Check if the file exists
-        if not os.path.exists(image_path):
-            raise HTTPException(status_code=404, detail="image.jpg file not found in the current directory")
-        
-        # Read the image file
-        with open(image_path, "rb") as image_file:
-            image_data = image_file.read()
-        
-        # Scan the receipt
-        receipt_data = ReceiptScanner.scan_receipt(image_data)
-        
-        return {
-            "total_amount": receipt_data.get("total_amount"),
-            "date": receipt_data.get("date", ""),
-            "vendor": receipt_data.get("vendor", "Unknown Vendor"),
-            "raw_text": receipt_data.get("raw_text", ""),
-            "success": True,
-            "message": "Receipt scanned successfully"
-        }
-        
-    except Exception as e:
-        logger.error(f"Error scanning receipt: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error scanning receipt: {str(e)}")
-
-@app.post("/scan-receipt-create-expense/", response_model=dict)
-async def scan_receipt_and_create_expense(
-    paid_by: str,
-    split_between: List[str],
-    group_id: Optional[str] = None,
+class ExpenseCreate(BaseModel):
+    description: str = Field(..., example="Dinner at restaurant")
+    amount: float = Field(..., gt=0, example=150.50)
+    paid_by_user_id: str
+    split_among_user_ids: List[str]
+    group_id: str
     category: Optional[str] = None
-):
-    """Scan receipt from image.jpg and automatically create an expense"""
+
+# API Endpoints
+
+@app.get("/", response_model=ApiResponse)
+async def health_check():
+    """Health check - verify API is running"""
+    return ApiResponse(
+        success=True,
+        message="Splitwise AI API is running",
+        data={
+            "version": "2.0.0",
+            "workflow": "Scan → Categorize → Optimize",
+            "endpoints": 8,
+            "ai_enabled": expense_categorizer.use_llm
+        }
+    )
+
+@app.post("/groups/create", response_model=ApiResponse)
+async def create_group(group: GroupCreate):
+    """Create new expense-sharing group"""
     try:
-        # First scan the receipt
-        image_path = "image.jpg"
+        group_id = f"group_{len(groups_db) + 1}"
         
-        if not os.path.exists(image_path):
-            raise HTTPException(status_code=404, detail="image.jpg file not found in the current directory")
+        # Store members in users database
+        for member in group.members:
+            if member.id not in users_db:
+                users_db[member.id] = member.dict()
         
-        with open(image_path, "rb") as image_file:
-            image_data = image_file.read()
+        # Create group record
+        group_record = {
+            "id": group_id,
+            "name": group.name,
+            "members": [member.dict() for member in group.members],
+            "created_at": datetime.now().isoformat(),
+            "total_expenses": 0,
+            "total_amount": 0.0
+        }
         
-        receipt_data = ReceiptScanner.scan_receipt(image_data)
+        groups_db[group_id] = group_record
+        logger.info(f"Group created: {group_id}")
         
-        if receipt_data.get("total_amount") is None:
-            raise HTTPException(status_code=400, detail="Could not extract total amount from receipt")
-        
-        # Create expense from receipt data
-        expense_data = ExpenseCreate(
-            description=f"Receipt from {receipt_data.get('vendor', 'Unknown Vendor')}",
-            amount=receipt_data["total_amount"],
-            paid_by=paid_by,
-            split_between=split_between,
-            category=category or "Miscellaneous",
-            group_id=group_id
+        return ApiResponse(
+            success=True,
+            message=f"Group '{group.name}' created successfully",
+            data={"group": group_record}
         )
         
-        # Validate that paid_by user exists
-        if paid_by not in users_db:
-            raise HTTPException(status_code=400, detail=f"User {paid_by} does not exist")
+    except Exception as e:
+        logger.error(f"Group creation failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/groups/{group_id}", response_model=ApiResponse)
+async def get_group(group_id: str):
+    """Get group details and members"""
+    if group_id not in groups_db:
+        raise HTTPException(status_code=404, detail="Group not found")
+    
+    return ApiResponse(
+        success=True,
+        message="Group found",
+        data={"group": groups_db[group_id]}
+    )
+
+@app.post("/scan-receipt", response_model=ApiResponse)
+async def scan_receipt_and_create_expense(
+    file: UploadFile = File(...),
+    group_id: str = Form(...),
+    paid_by_user_id: str = Form(...),
+    split_among_user_ids: str = Form(...)
+):
+    """Main feature: Scan receipt -> Auto-categorize -> Create expense"""
+    try:
+        # Validate inputs
+        if group_id not in groups_db:
+            raise HTTPException(status_code=404, detail="Group not found")
         
-        # Validate that all split_between users exist
-        for user_id in split_between:
-            if user_id not in users_db:
-                raise HTTPException(status_code=400, detail=f"User {user_id} does not exist")
+        split_users = json.loads(split_among_user_ids)
         
-        # Validate that group exists if provided
-        if group_id and group_id not in groups_db:
-            raise HTTPException(status_code=400, detail=f"Group {group_id} does not exist")
+        if not file.content_type or not file.content_type.startswith('image/'):
+            raise HTTPException(status_code=400, detail="Please upload a valid image")
         
-        expense_id = str(len(expenses_db) + 1)
+        # Step 1: OCR scan receipt
+        logger.info("Scanning receipt...")
+        image_data = await file.read()
+        receipt_data = ReceiptScanner.scan_receipt(image_data)
         
-        expenses_db[expense_id] = {
+        if not receipt_data.get("total_amount"):
+            return ApiResponse(
+                success=False,
+                message="Could not extract amount from receipt. Try a clearer image.",
+                data={"raw_text": receipt_data.get("raw_text", "")}
+            )
+        
+        # Step 2: AI categorization
+        logger.info("AI categorizing...")
+        vendor = receipt_data.get("vendor", "Unknown Vendor")
+        description = f"Receipt from {vendor}"
+        
+        try:
+            category = expense_categorizer.categorize(description=description, vendor=vendor)
+        except Exception as e:
+            logger.warning(f"Categorization failed: {e}")
+            category = "Gifts & Miscellaneous"
+        
+        # Step 3: Create expense
+        expense_id = f"exp_{len(expenses_db) + 1}"
+        amount = receipt_data["total_amount"]
+        
+        expense = {
             "id": expense_id,
-            **expense_data.dict(),
+            "description": description,
+            "amount": amount,
+            "paid_by_user_id": paid_by_user_id,
+            "split_among_user_ids": split_users,
+            "group_id": group_id,
+            "category": category,
+            "receipt_data": receipt_data,
             "created_at": datetime.now().isoformat()
         }
         
-        # Calculate debts
-        amount_per_person = expense_data.amount / len(expense_data.split_between)
-        for debtor in expense_data.split_between:
-            if debtor != expense_data.paid_by:
-                debt_id = f"{expense_id}_{debtor}"
-                debts_db[debt_id] = {
-                    "debtor": debtor,
-                    "creditor": expense_data.paid_by,
-                    "amount": amount_per_person,
-                    "expense_id": expense_id,
-                    "group_id": expense_data.group_id,
-                    "created_at": datetime.now().isoformat(),
-                    "status": "pending"
-                }
+        expenses_db[expense_id] = expense
         
-        return {
-            "success": True,
-            "message": "Receipt scanned and expense created successfully",
-            "receipt_data": receipt_data,
-            "expense": expenses_db[expense_id]
+        # Update group stats
+        groups_db[group_id]["total_expenses"] += 1
+        groups_db[group_id]["total_amount"] += amount
+        
+        logger.info(f"Expense created: ₹{amount} -> {category}")
+        
+        return ApiResponse(
+            success=True,
+            message=f"Receipt scanned! ₹{amount} auto-categorized as '{category}'",
+            data={
+                "expense": expense,
+                "amount": amount,
+                "vendor": vendor,
+                "category": category
+            }
+        )
+        
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid user IDs format")
+    except Exception as e:
+        logger.error(f"Receipt processing failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/expenses/manual", response_model=ApiResponse)
+async def create_manual_expense(expense: ExpenseCreate):
+    """Create manual expense (backup method)"""
+    try:
+        if expense.group_id not in groups_db:
+            raise HTTPException(status_code=404, detail="Group not found")
+        
+        # Auto-categorize
+        category = expense.category or expense_categorizer.categorize(expense.description)
+        
+        expense_id = f"exp_{len(expenses_db) + 1}"
+        expense_dict = {
+            "id": expense_id,
+            **expense.dict(),
+            "category": category,
+            "created_at": datetime.now().isoformat()
         }
         
-    except HTTPException:
-        raise
+        expenses_db[expense_id] = expense_dict
+        
+        # Update group stats
+        groups_db[expense.group_id]["total_expenses"] += 1
+        groups_db[expense.group_id]["total_amount"] += expense.amount
+        
+        return ApiResponse(
+            success=True,
+            message=f"Manual expense ₹{expense.amount} added",
+            data={"expense": expense_dict, "category": category}
+        )
+        
     except Exception as e:
-        logger.error(f"Error scanning receipt and creating expense: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error processing receipt: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/groups/{group_id}/expenses", response_model=ApiResponse)
+async def get_group_expenses(group_id: str):
+    """Get all expenses for a group"""
+    if group_id not in groups_db:
+        raise HTTPException(status_code=404, detail="Group not found")
+    
+    # Get expenses for this group
+    group_expenses = [
+        expense for expense in expenses_db.values()
+        if expense["group_id"] == group_id
+    ]
+    
+    # Calculate category breakdown
+    category_totals = {}
+    for expense in group_expenses:
+        category = expense["category"]
+        category_totals[category] = category_totals.get(category, 0) + expense["amount"]
+    
+    # Sort by date (newest first)
+    group_expenses.sort(key=lambda x: x["created_at"], reverse=True)
+    
+    return ApiResponse(
+        success=True,
+        message=f"Found {len(group_expenses)} expenses",
+        data={
+            "expenses": group_expenses,
+            "category_breakdown": category_totals,
+            "total_amount": sum(exp["amount"] for exp in group_expenses)
+        }
+    )
+
+@app.post("/groups/{group_id}/calculate-settlement", response_model=ApiResponse)
+async def calculate_settlement(group_id: str):
+    """Calculate optimal settlement to minimize transactions"""
+    try:
+        if group_id not in groups_db:
+            raise HTTPException(status_code=404, detail="Group not found")
+        
+        # Get group expenses
+        group_expenses = [
+            expense for expense in expenses_db.values()
+            if expense["group_id"] == group_id
+        ]
+        
+        if not group_expenses:
+            return ApiResponse(
+                success=True,
+                message="No expenses to settle",
+                data={"settlements": [], "balances": {}}
+            )
+        
+        # Prepare data for settlement optimizer
+        adapted_expenses = []
+        for expense in group_expenses:
+            adapted_expenses.append({
+                "paid_by": expense["paid_by_user_id"],
+                "amount": expense["amount"],
+                "split_between": expense["split_among_user_ids"]
+            })
+        
+        # Calculate optimal settlements
+        logger.info("Calculating optimal settlements...")
+        settlement_result = SettlementOptimizer.optimize_settlements(adapted_expenses)
+        
+        # Format for UI
+        group_members = {m["id"]: m for m in groups_db[group_id]["members"]}
+        settlements = []
+        
+        for settlement in settlement_result["optimal_settlements"]:
+            from_user = group_members.get(settlement["from"], {"name": f"User {settlement['from']}"})
+            to_user = group_members.get(settlement["to"], {"name": f"User {settlement['to']}"})
+            
+            settlements.append({
+                "from_user_id": settlement["from"],
+                "to_user_id": settlement["to"],
+                "from_user": from_user,
+                "to_user": to_user,
+                "amount": settlement["amount"],
+                "message": f"{from_user['name']} pays ₹{settlement['amount']:.2f} to {to_user['name']}"
+            })
+        
+        logger.info(f"Settlement optimized: {len(settlements)} transactions")
+        
+        return ApiResponse(
+            success=True,
+            message=f"Settlement calculated: {len(settlements)} payments needed",
+            data={
+                "settlements": settlements,
+                "balances": settlement_result["balances"],
+                "total_transactions": len(settlements)
+            }
+        )
+        
+    except Exception as e:
+        logger.error(f"Settlement calculation failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/categories", response_model=ApiResponse)
+async def get_categories():
+    """Get available expense categories"""
+    return ApiResponse(
+        success=True,
+        message="Categories retrieved",
+        data={
+            "categories": ExpenseCategorizer.CATEGORIES,
+            "examples": ExpenseCategorizer.CATEGORY_EXAMPLES,
+            "ai_powered": expense_categorizer.use_llm
+        }
+    )
+
+# Startup
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    
+    print("\n🚀 SPLITWISE AI - EXPENSE SHARING API")
+    print("="*50)
+    print("📱 8 Essential Endpoints")
+    print("� Docs: http://localhost:8000/docs")
+    print("🎯 Workflow: Scan -> Categorize -> Optimize")
+    print("="*50)
+    
+    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)

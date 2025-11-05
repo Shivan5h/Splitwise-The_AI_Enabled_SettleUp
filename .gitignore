@@ -122,3 +122,19 @@ dmypy.json
 .Trashes
 ehthumbs.db
 Thumbs.db
+
+# Image files
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.tiff
+*.tif
+*.webp
+*.svg
+*.ico
+*.raw
+*.psd
+*.ai
+*.eps
