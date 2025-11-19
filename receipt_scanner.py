@@ -1,406 +1,408 @@
-import io
-import cv2
-import numpy as np
-import pytesseract
-from PIL import Image, ImageEnhance, ImageFilter
-from datetime import datetime
+import torch
+from transformers import DonutProcessor, VisionEncoderDecoderModel
+from PIL import Image, ImageEnhance
+import requests
 import re
+import json
+from typing import Dict, List, Optional, Union
 import logging
+import io
+import pytesseract
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-class ReceiptScanner:
-    @staticmethod
-    def preprocess_image(image_data):
-        """Enhanced image preprocessing for better OCR accuracy"""
-        try:
-            # Load image
-            image = Image.open(io.BytesIO(image_data))
-            
-            # Convert to RGB if needed
-            if image.mode != 'RGB':
-                image = image.convert('RGB')
-            
-            # Enhance image quality
-            image = ReceiptScanner.enhance_image_quality(image)
-            
-            # Convert PIL to OpenCV format
-            open_cv_image = np.array(image)
-            open_cv_image = cv2.cvtColor(open_cv_image, cv2.COLOR_RGB2BGR)
-            
-            # Apply multiple preprocessing techniques
-            processed_image = ReceiptScanner.apply_image_processing(open_cv_image)
-            
-            return processed_image
-            
-        except Exception as e:
-            logger.error(f"Error in image preprocessing: {e}")
-            raise e
+class DonutReceiptScanner:
+    def __init__(self, model_name: str = "naver-clova-ix/donut-base-finetuned-cord-v2"):
+        """
+        Initialize Donut Receipt Scanner
+        
+        Args:
+            model_name: Hugging Face model name for Donut
+        """
+        self.model_name = model_name
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        logger.info(f"Using device: {self.device}")
+        
+        # Load processor and model
+        self.processor = DonutProcessor.from_pretrained(model_name)
+        self.model = VisionEncoderDecoderModel.from_pretrained(model_name)
+        self.model.to(self.device)
+        self.model.eval()
+        
+        logger.info("Donut model loaded successfully")
     
-    @staticmethod
-    def enhance_image_quality(pil_image):
-        """Enhance PIL image quality before OpenCV processing"""
-        # Resize if image is too small
-        width, height = pil_image.size
-        if width < 800 or height < 600:
-            scale_factor = max(800/width, 600/height)
-            new_size = (int(width * scale_factor), int(height * scale_factor))
-            pil_image = pil_image.resize(new_size, Image.Resampling.LANCZOS)
+    def preprocess_image(self, image: Image.Image) -> Image.Image:
+        """
+        Preprocess image for better OCR results
+        """
+        # Convert to RGB if necessary
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
         
         # Enhance contrast
-        enhancer = ImageEnhance.Contrast(pil_image)
-        pil_image = enhancer.enhance(1.5)
+        enhancer = ImageEnhance.Contrast(image)
+        image = enhancer.enhance(1.5)
         
         # Enhance sharpness
-        enhancer = ImageEnhance.Sharpness(pil_image)
-        pil_image = enhancer.enhance(2.0)
+        enhancer = ImageEnhance.Sharpness(image)
+        image = enhancer.enhance(1.2)
         
-        # Apply slight denoising
-        pil_image = pil_image.filter(ImageFilter.MedianFilter())
-        
-        return pil_image
+        return image
     
-    @staticmethod
-    def apply_image_processing(cv_image):
-        """Apply OpenCV image processing techniques"""
-        # Convert to grayscale
-        gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
-        
-        # Apply Gaussian blur to reduce noise
-        blurred = cv2.GaussianBlur(gray, (3, 3), 0)
-        
-        # Apply adaptive thresholding for better text extraction
-        adaptive_thresh = cv2.adaptiveThreshold(
-            blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
-        )
-        
-        # Alternative: OTSU thresholding
-        _, otsu_thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        
-        # Morphological operations to clean up the image
-        kernel = np.ones((2, 2), np.uint8)
-        adaptive_thresh = cv2.morphologyEx(adaptive_thresh, cv2.MORPH_CLOSE, kernel)
-        adaptive_thresh = cv2.morphologyEx(adaptive_thresh, cv2.MORPH_OPEN, kernel)
-        
-        # Try both thresholding methods and return the one with better text detection
-        return ReceiptScanner.select_best_processed_image(adaptive_thresh, otsu_thresh)
-    
-    @staticmethod
-    def select_best_processed_image(adaptive_thresh, otsu_thresh):
-        """Select the better processed image based on text detection confidence"""
+    def load_image(self, image_source: str) -> Image.Image:
+        """
+        Load image from file path or URL
+        """
         try:
-            # Quick OCR test on both images to see which gives better results
-            adaptive_text = pytesseract.image_to_string(adaptive_thresh, config='--psm 6')
-            otsu_text = pytesseract.image_to_string(otsu_thresh, config='--psm 6')
+            if image_source.startswith('http'):
+                response = requests.get(image_source, stream=True, timeout=30)
+                image = Image.open(response.raw)
+            else:
+                image = Image.open(image_source)
             
-            # Simple heuristic: choose the one with more alphanumeric characters
-            adaptive_score = len(re.findall(r'[a-zA-Z0-9]', adaptive_text))
-            otsu_score = len(re.findall(r'[a-zA-Z0-9]', otsu_text))
-            
-            return adaptive_thresh if adaptive_score >= otsu_score else otsu_thresh
-            
-        except:
-            # If OCR fails, default to adaptive threshold
-            return adaptive_thresh
+            return self.preprocess_image(image)
+        except Exception as e:
+            logger.error(f"Error loading image: {e}")
+            raise
     
-    @staticmethod
-    def extract_text(image_data):
-        """Extract text using OCR with multiple configurations"""
+    def extract_receipt_data(self, image_source: str, max_length: int = 768) -> Dict:
+        """
+        Extract receipt data from image
+        
+        Args:
+            image_source: Path to image or URL
+            max_length: Maximum sequence length for generation
+            
+        Returns:
+            Dictionary containing extracted receipt information
+        """
         try:
-            processed_image = ReceiptScanner.preprocess_image(image_data)
+            # Load and preprocess image
+            image = self.load_image(image_source)
             
-            # Try multiple OCR configurations
-            ocr_configs = [
-                '--psm 6',  # Uniform block of text
-                '--psm 4',  # Single column of text
-                '--psm 1',  # Automatic page segmentation with OSD
-                '--psm 3',  # Fully automatic page segmentation
-            ]
+            # Prepare inputs
+            task_prompt = "<s_cord-v2>"
+            decoder_input_ids = self.processor.tokenizer(
+                task_prompt, 
+                add_special_tokens=False, 
+                return_tensors="pt"
+            ).input_ids
             
-            best_text = ""
-            best_confidence = 0
+            # Process image
+            pixel_values = self.processor(image, return_tensors="pt").pixel_values
             
-            for config in ocr_configs:
-                try:
-                    # Get text with confidence scores
-                    data = pytesseract.image_to_data(processed_image, config=config, output_type=pytesseract.Output.DICT)
-                    
-                    # Calculate average confidence
-                    confidences = [int(conf) for conf in data['conf'] if int(conf) > 0]
-                    avg_confidence = sum(confidences) / len(confidences) if confidences else 0
-                    
-                    # Get the actual text
-                    text = pytesseract.image_to_string(processed_image, config=config)
-                    
-                    # Choose the result with highest confidence
-                    if avg_confidence > best_confidence and len(text.strip()) > 10:
-                        best_confidence = avg_confidence
-                        best_text = text
-                        
-                except Exception as config_error:
-                    logger.warning(f"OCR config {config} failed: {config_error}")
-                    continue
+            # Generate output
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    pixel_values.to(self.device),
+                    decoder_input_ids=decoder_input_ids.to(self.device),
+                    max_length=max_length,
+                    early_stopping=True,
+                    pad_token_id=self.processor.tokenizer.pad_token_id,
+                    eos_token_id=self.processor.tokenizer.eos_token_id,
+                    use_cache=True,
+                    num_beams=2,  # Increased for better accuracy
+                    bad_words_ids=[[self.processor.tokenizer.unk_token_id]],
+                    return_dict_in_generate=True,
+                    output_scores=True,
+                )
             
-            # If no good result, try with basic config
-            if not best_text.strip():
-                best_text = pytesseract.image_to_string(processed_image)
+            # Decode output
+            sequence = self.processor.batch_decode(outputs.sequences)[0]
+            sequence = self.clean_sequence(sequence)
             
-            logger.info(f"OCR completed with confidence: {best_confidence:.2f}")
-            return best_text
+            # Convert to JSON
+            result = self.processor.token2json(sequence)
+            
+            # Post-process results
+            processed_result = self.post_process_results(result)
+            
+            logger.info("Successfully extracted receipt data")
+            return processed_result
             
         except Exception as e:
-            logger.error(f"Error extracting text: {e}")
-            return ReceiptScanner.extract_text_fallback(image_data)
+            logger.error(f"Error extracting receipt data: {e}")
+            return {
+                "store_name": "Error",
+                "total_amount": "0.00",
+                "date": "Error",
+                "subtotal": "0.00",
+                "tax": "0.00",
+                "items": [],
+                "confidence": 0.0,
+                "error": str(e)
+            }
     
-    @staticmethod
-    def extract_text_fallback(image_data):
+    def clean_sequence(self, sequence: str) -> str:
         """
-        Fallback method when Tesseract is not available.
-        Provides helpful error message and guidance instead of fake data.
+        Clean the generated sequence
+        """
+        # Remove special tokens
+        sequence = sequence.replace(self.processor.tokenizer.eos_token, "")
+        sequence = sequence.replace(self.processor.tokenizer.pad_token, "")
+        
+        # Remove task prompt
+        sequence = re.sub(r"<.*?>", "", sequence, count=1).strip()
+        
+        return sequence
+    
+    def post_process_results(self, raw_result: Dict) -> Dict:
+        """
+        Post-process and validate extracted results
+        """
+        # Default values
+        processed = {
+            "store_name": self.extract_store_name(raw_result),
+            "total_amount": self.extract_total_amount(raw_result),
+            "date": raw_result.get("date", "Unknown"),
+            "subtotal": raw_result.get("subtotal", "0.00"),
+            "tax": raw_result.get("tax", "0.00"),
+            "items": self.extract_items(raw_result),
+            "currency": "USD",
+            "confidence": 0.8,  # Placeholder for confidence score
+            "raw_result": raw_result
+        }
+        
+        # Validate and clean amounts
+        processed["total_amount"] = self.clean_amount(processed["total_amount"])
+        processed["subtotal"] = self.clean_amount(processed["subtotal"])
+        processed["tax"] = self.clean_amount(processed["tax"])
+        
+        return processed
+    
+    def extract_store_name(self, result: Dict) -> str:
+        """
+        Extract store name from various possible fields
+        """
+        store_fields = ["company", "store", "shop", "vendor", "merchant"]
+        
+        for field in store_fields:
+            if field in result and result[field]:
+                store_name = str(result[field]).strip()
+                if store_name and store_name != "N/A":
+                    return store_name
+        
+        return "Unknown Store"
+    
+    def extract_total_amount(self, result: Dict) -> str:
+        """
+        Extract total amount from various possible fields
+        """
+        total_fields = ["total", "total_paid", "amount", "grand_total"]
+        
+        for field in total_fields:
+            if field in result and result[field]:
+                amount = str(result[field]).strip()
+                if amount and amount != "N/A":
+                    return amount
+        
+        return "0.00"
+    
+    def extract_items(self, result: Dict) -> List[Dict]:
+        """
+        Extract line items from receipt
+        """
+        items = []
+        
+        if "items" in result and isinstance(result["items"], list):
+            for item in result["items"]:
+                if isinstance(item, dict):
+                    cleaned_item = {
+                        "description": item.get("description", ""),
+                        "quantity": item.get("quantity", "1"),
+                        "price": self.clean_amount(item.get("price", "0.00")),
+                        "amount": self.clean_amount(item.get("amount", "0.00"))
+                    }
+                    items.append(cleaned_item)
+        
+        return items
+    
+    def clean_amount(self, amount: str) -> str:
+        """
+        Clean and format amount strings
+        """
+        if not amount or amount == "N/A":
+            return "0.00"
+        
+        # Remove currency symbols and extra spaces
+        amount = re.sub(r'[^\d.]', '', str(amount))
+        
+        # Ensure proper decimal format
+        if '.' in amount:
+            parts = amount.split('.')
+            if len(parts) == 2:
+                integer_part = parts[0]
+                decimal_part = parts[1][:2].ljust(2, '0')
+                amount = f"{integer_part}.{decimal_part}"
+        else:
+            amount = f"{amount}.00"
+        
+        return amount
+    
+    def batch_process(self, image_paths: List[str]) -> List[Dict]:
+        """
+        Process multiple receipts in batch
+        """
+        results = []
+        for path in image_paths:
+            try:
+                result = self.extract_receipt_data(path)
+                result["file_path"] = path
+                results.append(result)
+            except Exception as e:
+                logger.error(f"Error processing {path}: {e}")
+                results.append({
+                    "file_path": path,
+                    "error": str(e),
+                    "store_name": "Error",
+                    "total_amount": "0.00"
+                })
+        
+        return results
+
+    def get_model_info(self) -> Dict:
+        """
+        Get information about the loaded model
+        """
+        return {
+            "model_name": self.model_name,
+            "device": self.device,
+            "processor_type": type(self.processor).__name__,
+            "model_type": type(self.model).__name__,
+            "vocab_size": self.processor.tokenizer.vocab_size
+        }
+
+    def extract_receipt_from_pil(self, image: Image.Image, max_length: int = 768) -> Dict:
+        """
+        Extract receipt data when caller already has a PIL Image (e.g. from bytes).
         """
         try:
-            # Try to at least load and analyze the image
-            image = Image.open(io.BytesIO(image_data))
-            width, height = image.size
-            
-            # Return informative message about the uploaded image
-            return f"""OCR_ERROR: Tesseract not installed
+            # Ensure image is preprocessed similar to load_image
+            image = self.preprocess_image(image)
 
-IMAGE_INFO:
-- Format: {image.format}
-- Dimensions: {width}x{height} pixels
+            task_prompt = "<s_cord-v2>"
+            decoder_input_ids = self.processor.tokenizer(
+                task_prompt,
+                add_special_tokens=False,
+                return_tensors="pt"
+            ).input_ids
 
-"""
+            pixel_values = self.processor(image, return_tensors="pt").pixel_values
 
-        except Exception as img_error:
-            return f"""ERROR: Cannot process image
-            
-DETAILS: {str(img_error)}
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    pixel_values.to(self.device),
+                    decoder_input_ids=decoder_input_ids.to(self.device),
+                    max_length=max_length,
+                    early_stopping=True,
+                    pad_token_id=self.processor.tokenizer.pad_token_id,
+                    eos_token_id=self.processor.tokenizer.eos_token_id,
+                    use_cache=True,
+                    num_beams=2,
+                    bad_words_ids=[[self.processor.tokenizer.unk_token_id]],
+                    return_dict_in_generate=True,
+                    output_scores=True,
+                )
 
-POSSIBLE_CAUSES:
-- Corrupted image file
-- Unsupported image format
-- Memory issues
+            sequence = self.processor.batch_decode(outputs.sequences)[0]
+            sequence = self.clean_sequence(sequence)
+            result = self.processor.token2json(sequence)
+            processed_result = self.post_process_results(result)
+            return processed_result
+        except Exception as e:
+            logger.error(f"Error extracting receipt from PIL image: {e}")
+            raise
 
-SOLUTION: Try uploading a different image (JPG, PNG, JPEG)"""
-        
-    @staticmethod
-    def parse_receipt(text):
-        """Enhanced receipt parsing with improved pattern recognition"""
-        # Check if this is an error message from fallback
-        if text.startswith("OCR_ERROR:") or text.startswith("ERROR:"):
-            return {
-                "total_amount": None,
-                "date": datetime.now().strftime("%Y-%m-%d"),
-                "time": datetime.now().strftime("%H:%M"),
-                "vendor": "OCR Error - Tesseract not installed",
-                "raw_text": text
-            }
-        
-        # Clean the text
-        clean_text = ReceiptScanner.clean_text(text)
-        
-        # Extract total amount
-        total_amount = ReceiptScanner.extract_total_amount(clean_text)
-        
-        # Extract date and time
-        date_info = ReceiptScanner.extract_date_time(clean_text)
-        
-        # Extract vendor
-        vendor = ReceiptScanner.extract_vendor(clean_text)
-        
-        return {
-            "total_amount": total_amount,
-            "date": date_info["date"],
-            "time": date_info["time"],
-            "vendor": vendor,
-            "raw_text": text
-        }
+
+class ReceiptScanner:
+    """High-level scanner for FastAPI.
     
+    Attempts Tesseract OCR first (faster, lighter), then Donut AI as fallback.
+    Returns: dict with total_amount, vendor, raw_text, items
+    """
     @staticmethod
-    def clean_text(text):
-        """Clean and normalize the OCR text"""
-        # Remove extra whitespace and normalize
-        lines = [line.strip() for line in text.split('\n') if line.strip()]
-        clean_text = '\n'.join(lines)
-        
-        # Fix common OCR errors
-        replacements = {
-            '|': 'I',  # Common OCR mistake
-            '0': 'O',  # In vendor names
-            '5': 'S',  # In vendor names (context-dependent)
-        }
-        
-        # Apply replacements carefully (only for non-numeric contexts)
-        return clean_text
-    
-    @staticmethod
-    def extract_total_amount(text):
-        """Extract total amount with comprehensive pattern matching"""
-        # Enhanced patterns for various receipt formats
-        total_patterns = [
-            # Standard total patterns
-            r'total[\s:]*[₹\$]?\s*(\d+[,.]?\d*\.?\d{0,2})',
-            r'grand\s*total[\s:]*[₹\$]?\s*(\d+[,.]?\d*\.?\d{0,2})',
-            r'net\s*total[\s:]*[₹\$]?\s*(\d+[,.]?\d*\.?\d{0,2})',
-            r'final\s*total[\s:]*[₹\$]?\s*(\d+[,.]?\d*\.?\d{0,2})',
-            
-            # Amount patterns
-            r'amount[\s:]*[₹\$]?\s*(\d+[,.]?\d*\.?\d{0,2})',
-            r'amount\s*due[\s:]*[₹\$]?\s*(\d+[,.]?\d*\.?\d{0,2})',
-            r'total\s*amount[\s:]*[₹\$]?\s*(\d+[,.]?\d*\.?\d{0,2})',
-            
-            # Balance patterns
-            r'balance[\s:]*[₹\$]?\s*(\d+[,.]?\d*\.?\d{0,2})',
-            r'balance\s*due[\s:]*[₹\$]?\s*(\d+[,.]?\d*\.?\d{0,2})',
-            
-            # Payment patterns
-            r'cash[\s:]*[₹\$]?\s*(\d+[,.]?\d*\.?\d{0,2})',
-            r'paid[\s:]*[₹\$]?\s*(\d+[,.]?\d*\.?\d{0,2})',
-            
-            # Currency symbol patterns
-            r'[₹\$]\s*(\d+[,.]?\d*\.?\d{0,2})\s*$',  # Currency at start, amount at end of line
-            r'(\d+[,.]?\d*\.?\d{0,2})\s*[₹\$]?\s*$',  # Amount at end of line
-            
-            # Standalone number patterns (last resort)
-            r'^(\d+\.\d{2})$',  # Exact decimal format on its own line
-        ]
+    def scan_receipt(image_bytes: bytes) -> Dict:
+        try:
+            img = Image.open(io.BytesIO(image_bytes))
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+        except Exception as e:
+            logger.error(f"Failed to open image: {e}")
+            return {"total_amount": 0.0, "vendor": "Error", "raw_text": "", "error": str(e)}
 
-        total_amount = None
-        found_amounts = []
-        
-        # Split text into lines for line-by-line analysis
-        lines = text.split('\n')
-        
-        for pattern in total_patterns:
-            for line in lines:
-                matches = re.findall(pattern, line, re.IGNORECASE)
+        # Try Tesseract first (faster, no GPU needed)
+        try:
+            ocr_text = pytesseract.image_to_string(img)
+            
+            # Extract amounts using regex
+            amount_patterns = [
+                r"total[:\s]*\$?([\d,]+\.\d{2})",  # Total: $123.45
+                r"amount[:\s]*\$?([\d,]+\.\d{2})",  # Amount: $123.45
+                r"\$([\d,]+\.\d{2})",               # $123.45
+                r"([\d,]+\.\d{2})"                  # 123.45
+            ]
+            
+            amounts = []
+            text_lower = ocr_text.lower()
+            for pattern in amount_patterns:
+                matches = re.findall(pattern, text_lower, re.IGNORECASE)
                 for match in matches:
                     try:
-                        # Clean the match (remove commas, handle decimal points)
-                        clean_amount = re.sub(r'[,\s]', '', match)
-                        amount = float(clean_amount)
-                        found_amounts.append((amount, pattern, line))
-                    except ValueError:
-                        continue
-        
-        # Select the most likely total amount
-        if found_amounts:
-            # Sort by amount (descending) and pattern priority
-            found_amounts.sort(key=lambda x: (-x[0], total_patterns.index(x[1])))
-            total_amount = found_amounts[0][0]
-            logger.info(f"Found total amount: {total_amount} from pattern: {found_amounts[0][1]}")
-        
-        return total_amount
-    
-    @staticmethod
-    def extract_date_time(text):
-        """Extract date and time information"""
-        # Enhanced date patterns supporting multiple formats
-        date_patterns = [
-            # dd/mm/yyyy and dd-mm-yyyy formats
-            r'(\d{1,2}[-/]\d{1,2}[-/]\d{4})',
-            # yyyy-mm-dd format
-            r'(\d{4}[-/]\d{1,2}[-/]\d{1,2})',
-            # dd/mm/yy format
-            r'(\d{1,2}[-/]\d{1,2}[-/]\d{2})',
-            # Month name formats
-            r'(\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{4})',
-        ]
-        
-        # Time patterns
-        time_patterns = [
-            r'(\d{1,2}:\d{2}:\d{2})',  # HH:MM:SS
-            r'(\d{1,2}:\d{2})\s*(?:am|pm)?',  # HH:MM with optional AM/PM
-            r'time[\s:]*(\d{1,2}:\d{2})',  # Time: HH:MM
-        ]
-        
-        date = datetime.now().strftime("%Y-%m-%d")
-        time = datetime.now().strftime("%H:%M")
-        
-        # Extract date
-        for pattern in date_patterns:
-            match = re.search(pattern, text, re.IGNORECASE)
-            if match:
-                date_str = match.group(1)
-                # Normalize date format
-                try:
-                    # Try different parsing formats
-                    for fmt in ['%d/%m/%Y', '%d-%m-%Y', '%Y-%m-%d', '%d/%m/%y', '%d-%m-%y']:
-                        try:
-                            parsed_date = datetime.strptime(date_str, fmt)
-                            date = parsed_date.strftime("%Y-%m-%d")
-                            break
-                        except ValueError:
-                            continue
-                except:
-                    date = date_str  # Keep original if parsing fails
-                break
-        
-        # Extract time
-        for pattern in time_patterns:
-            match = re.search(pattern, text, re.IGNORECASE)
-            if match:
-                time = match.group(1)
-                break
-        
-        return {"date": date, "time": time}
-    
-    @staticmethod
-    def extract_vendor(text):
-        """Extract vendor/organization name with improved accuracy"""
-        lines = [line.strip() for line in text.split('\n') if line.strip()]
-        
-        if not lines:
-            return "Unknown Vendor"
-        
-        # Enhanced vendor detection patterns
-        vendor_indicators = [
-            r'restaurant', r'cafe', r'coffee', r'hotel', r'store', r'shop', r'mart',
-            r'retail', r'mall', r'plaza', r'center', r'centre', r'ltd', r'limited',
-            r'inc', r'corp', r'company', r'enterprises', r'services', r'digital',
-            r'pharmacy', r'medical', r'clinic', r'hospital', r'foods', r'kitchen'
-        ]
-        
-        vendor = "Unknown Vendor"
-        
-        # Strategy 1: Look for first meaningful line (not starting with numbers/symbols)
-        for line in lines[:5]:  # Check first 5 lines
-            line_clean = re.sub(r'[^\w\s]', '', line).strip()
-            if (len(line_clean) > 3 and 
-                not re.match(r'^\d', line_clean) and  # Doesn't start with number
-                not re.match(r'^(date|time|receipt|bill|invoice)', line_clean.lower()) and
-                len(line_clean.split()) <= 6):  # Not too many words
-                vendor = line.strip()
-                break
-        
-        # Strategy 2: Look for lines containing vendor indicators
-        if vendor == "Unknown Vendor":
-            for line in lines[:10]:
-                line_lower = line.lower()
-                for indicator in vendor_indicators:
-                    if indicator in line_lower:
-                        vendor = line.strip()
-                        break
-                if vendor != "Unknown Vendor":
+                        clean_amt = float(match.replace(',', ''))
+                        if clean_amt > 0:
+                            amounts.append(clean_amt)
+                    except:
+                        pass
+            
+            total_amount = max(amounts) if amounts else 0.0
+            
+            # Extract vendor (first non-empty line)
+            vendor = "Unknown"
+            for line in ocr_text.splitlines():
+                line = line.strip()
+                if line and len(line) > 2:
+                    vendor = line[:50]  # Limit length
                     break
-        
-        # Strategy 3: Use the first non-empty line as fallback
-        if vendor == "Unknown Vendor" and lines:
-            first_line = lines[0].strip()
-            if len(first_line) > 2 and not first_line.isdigit():
-                vendor = first_line
-        
-        # Clean up the vendor name
-        vendor = re.sub(r'[^\w\s&\'-]', '', vendor).strip()
-        vendor = ' '.join(vendor.split())  # Normalize whitespace
-        
-        return vendor if vendor else "Unknown Vendor"
-    
-    @staticmethod
-    def scan_receipt(image_data):
-        text = ReceiptScanner.extract_text(image_data)
-        receipt_data = ReceiptScanner.parse_receipt(text)
-        return receipt_data
+            
+            if total_amount > 0:
+                logger.info(f"Tesseract OCR: ${total_amount} from {vendor}")
+                return {
+                    "total_amount": total_amount,
+                    "vendor": vendor,
+                    "raw_text": ocr_text,
+                    "items": [],
+                    "method": "tesseract"
+                }
+        except Exception as e:
+            logger.warning(f"Tesseract failed: {e}. Trying Donut AI...")
+
+        # Fallback to Donut AI (slower but more accurate)
+        try:
+            donut = DonutReceiptScanner()
+            result = donut.extract_receipt_from_pil(img)
+            
+            total = result.get("total_amount", "0")
+            try:
+                total_val = float(re.sub(r"[^0-9.]", "", str(total)) or 0)
+            except:
+                total_val = 0.0
+            
+            logger.info(f"Donut AI: ${total_val} from {result.get('store_name', 'Unknown')}")
+            return {
+                "total_amount": total_val,
+                "vendor": result.get("store_name", "Unknown"),
+                "raw_text": json.dumps(result.get("raw_result", {})),
+                "items": result.get("items", []),
+                "method": "donut"
+            }
+        except Exception as e:
+            logger.error(f"Both OCR methods failed: {e}")
+            return {
+                "total_amount": 0.0,
+                "vendor": "Unknown",
+                "raw_text": "",
+                "items": [],
+                "error": str(e)
+            }

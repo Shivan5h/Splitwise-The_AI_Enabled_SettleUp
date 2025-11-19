@@ -34,13 +34,9 @@ groups_db = {}
 expenses_db = {}
 users_db = {}
 
-# Initialize AI categorizer
-try:
-    expense_categorizer = ExpenseCategorizer(use_llm=True)
-    logger.info("AI categorizer loaded")
-except Exception as e:
-    expense_categorizer = ExpenseCategorizer(use_llm=False) 
-    logger.warning(f"Using rule-based categorizer: {e}")
+# Initialize AI categorizer (start with rule-based for faster startup)
+expense_categorizer = ExpenseCategorizer(use_llm=False)
+logger.info("Expense categorizer initialized (rule-based mode)")
 
 # Data models
 class User(BaseModel):
@@ -150,11 +146,14 @@ async def scan_receipt_and_create_expense(
         image_data = await file.read()
         receipt_data = ReceiptScanner.scan_receipt(image_data)
         
-        if not receipt_data.get("total_amount"):
+        if not receipt_data.get("total_amount") or receipt_data.get("total_amount") == 0:
             return ApiResponse(
                 success=False,
-                message="Could not extract amount from receipt. Try a clearer image.",
-                data={"raw_text": receipt_data.get("raw_text", "")}
+                message="Could not extract amount from receipt. Try a clearer image or add manually.",
+                data={
+                    "raw_text": receipt_data.get("raw_text", ""),
+                    "vendor": receipt_data.get("vendor", "")
+                }
             )
         
         # Step 2: AI categorization
@@ -356,11 +355,14 @@ async def get_categories():
 if __name__ == "__main__":
     import uvicorn
     
-    print("\n🚀 SPLITWISE AI - EXPENSE SHARING API")
-    print("="*50)
-    print("📱 8 Essential Endpoints")
-    print("� Docs: http://localhost:8000/docs")
-    print("🎯 Workflow: Scan -> Categorize -> Optimize")
-    print("="*50)
+    print("\n" + "="*60)
+    print("🚀 SPLITWISE AI - EXPENSE SHARING API")
+    print("="*60)
+    print("📱 Endpoints: 8")
+    print("📖 API Docs: http://localhost:8000/docs")
+    print("🌐 Server: http://0.0.0.0:8000")
+    print("🎯 Workflow: Scan → Categorize → Optimize")
+    print("📱 Kotlin App: Use http://10.0.2.2:8000 (Android Emulator)")
+    print("="*60 + "\n")
     
     uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)

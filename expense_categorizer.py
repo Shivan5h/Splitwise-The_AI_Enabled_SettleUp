@@ -161,23 +161,24 @@ class ExpenseCategorizer:
     def categorize_rule_based(self, description: str, vendor: str = None) -> str:
         if not description:
             return "Gifts & Miscellaneous"
-            
-        description_lower = description.lower()
         
-        # Keyword mapping (simplified version)
+        text = (description + " " + (vendor or "")).lower()
+        
+        # Enhanced keyword mapping with common vendor names
         keyword_mapping = {
-            "Housing & Shared Living": ["rent", "lease", "electric", "water", "gas", "internet", "wifi", "utility"],
-            "Food & Groceries": ["grocery", "restaurant", "cafe", "food", "meal", "dinner", "lunch", "coffee"],
-            "Travel & Trips": ["uber", "lyft", "taxi", "flight", "hotel", "train", "bus", "travel"],
-            "Events & Entertainment": ["movie", "netflix", "concert", "game", "bowling", "event", "ticket"],
-            "Household & Essentials": ["cleaning", "toilet", "supply", "furniture", "appliance"],
-            "Work / Education": ["office", "study", "course", "book", "software", "project"],
-            "Health & Fitness": ["gym", "sports", "fitness", "medical", "health"],
-            "Gifts & Miscellaneous": ["gift", "donation", "charity"]
+            "Housing & Shared Living": ["rent", "lease", "electric", "electricity", "water", "gas", "internet", "wifi", "utility", "bill"],
+            "Food & Groceries": ["grocery", "restaurant", "cafe", "food", "meal", "dinner", "lunch", "breakfast", "coffee", "mcdonald", "kfc", "pizza", "burger", "supermarket", "walmart", "store"],
+            "Travel & Trips": ["uber", "lyft", "ola", "taxi", "cab", "flight", "airline", "hotel", "airbnb", "train", "bus", "travel", "trip", "petrol", "fuel"],
+            "Events & Entertainment": ["movie", "cinema", "netflix", "spotify", "concert", "game", "bowling", "event", "ticket", "theatre", "show"],
+            "Household & Essentials": ["cleaning", "toilet", "detergent", "supply", "furniture", "appliance", "ikea", "home", "kitchen"],
+            "Work / Education": ["office", "study", "course", "book", "amazon", "software", "project", "stationery", "school", "college"],
+            "Health & Fitness": ["gym", "sports", "fitness", "medical", "health", "doctor", "medicine", "pharmacy", "yoga"],
+            "Gifts & Miscellaneous": ["gift", "donation", "charity", "present"]
         }
         
+        # Check vendor names and description
         for category, keywords in keyword_mapping.items():
-            if any(keyword in description_lower for keyword in keywords):
+            if any(keyword in text for keyword in keywords):
                 return category
         
         return "Gifts & Miscellaneous"

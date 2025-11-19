@@ -7,61 +7,68 @@ class SettlementOptimizer:
         balances = {}
         
         for expense in expenses:
-            payer = expense["paid_by"]
-            amount = expense["amount"]
-            split_count = len(expense["split_between"])
-            share = amount / split_count if split_count > 0 else 0
+            payer = expense.get("paid_by")
+            amount = expense.get("amount", 0)
+            split_between = expense.get("split_between", [])
             
-            # Update payer's balance
-            balances[payer] = balances.get(payer, 0) + amount
+            if not payer or not split_between or amount <= 0:
+                continue
             
-            # Update beneficiaries' balances
-            for user_id in expense["split_between"]:
-                balances[user_id] = balances.get(user_id, 0) - share
+            split_count = len(split_between)
+            share = round(amount / split_count, 2) if split_count > 0 else 0
+            
+            # Payer receives money back (paid more than their share)
+            balances[payer] = balances.get(payer, 0.0) + amount - share
+            
+            # Others owe their share
+            for user_id in split_between:
+                if user_id != payer:
+                    balances[user_id] = balances.get(user_id, 0.0) - share
         
         return balances
 
     @staticmethod
     def minimize_transactions(balances):
-        """Optimize settlements to minimize number of transactions"""
-        debts = []
+        """Optimize settlements using greedy algorithm to minimize transactions"""
+        # Filter out near-zero balances
+        creditors = [(uid, round(bal, 2)) for uid, bal in balances.items() if bal > 0.01]
+        debtors = [(uid, round(-bal, 2)) for uid, bal in balances.items() if bal < -0.01]
         
-        # Convert balances to list of debts
-        creditors = []
-        debtors = []
+        if not creditors or not debtors:
+            return []
         
-        for user_id, balance in balances.items():
-            if balance > 0:
-                creditors.append((user_id, balance))
-            elif balance < 0:
-                debtors.append((user_id, -balance))
-        
-        # Sort creditors and debtors
+        # Sort by amount (largest first) for optimal matching
         creditors.sort(key=lambda x: x[1], reverse=True)
         debtors.sort(key=lambda x: x[1], reverse=True)
         
-        # Distribute debts
+        settlements = []
         i = j = 0
+        
         while i < len(creditors) and j < len(debtors):
-            creditor, cred_amt = creditors[i]
-            debtor, deb_amt = debtors[j]
+            creditor_id, cred_amt = creditors[i]
+            debtor_id, deb_amt = debtors[j]
             
-            settlement_amt = min(cred_amt, deb_amt)
-            debts.append({
-                "from": debtor,
-                "to": creditor,
-                "amount": round(settlement_amt, 2)
-            })
+            # Settle the minimum of what's owed/owed to
+            settle_amt = min(cred_amt, deb_amt)
             
-            creditors[i] = (creditor, cred_amt - settlement_amt)
-            debtors[j] = (debtor, deb_amt - settlement_amt)
+            if settle_amt > 0.01:  # Only add if meaningful amount
+                settlements.append({
+                    "from": debtor_id,
+                    "to": creditor_id,
+                    "amount": round(settle_amt, 2)
+                })
             
-            if creditors[i][1] < 0.01:  # Floating point tolerance
+            # Update remaining balances
+            creditors[i] = (creditor_id, round(cred_amt - settle_amt, 2))
+            debtors[j] = (debtor_id, round(deb_amt - settle_amt, 2))
+            
+            # Move to next if settled
+            if creditors[i][1] < 0.01:
                 i += 1
-            if debtors[j][1] < 0.01:    # Floating point tolerance
+            if debtors[j][1] < 0.01:
                 j += 1
         
-        return debts
+        return settlements
 
     @staticmethod
     def optimize_settlements(expenses):
