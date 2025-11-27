@@ -1,17 +1,25 @@
 import torch
 from transformers import DonutProcessor, VisionEncoderDecoderModel
-from PIL import Image, ImageEnhance
+from PIL import Image, ImageEnhance, ImageFilter
 import requests
 import re
 import json
 from typing import Dict, List, Optional, Union
 import logging
 import io
-import pytesseract
+import cv2
+import numpy as np
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+try:
+    import easyocr
+    EASYOCR_AVAILABLE = True
+except ImportError:
+    EASYOCR_AVAILABLE = False
+    logger.warning("EasyOCR not available. Install with: pip install easyocr")
 
 class DonutReceiptScanner:
     def __init__(self, model_name: str = "naver-clova-ix/donut-base-finetuned-cord-v2"):
@@ -35,19 +43,42 @@ class DonutReceiptScanner:
     
     def preprocess_image(self, image: Image.Image) -> Image.Image:
         """
-        Preprocess image for better OCR results
+        Advanced preprocessing for better OCR accuracy
         """
         # Convert to RGB if necessary
         if image.mode != 'RGB':
             image = image.convert('RGB')
         
+        # Convert to numpy array for OpenCV processing
+        img_array = np.array(image)
+        
+        # Convert to grayscale for better text detection
+        gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+        
+        # Apply adaptive thresholding to handle varying lighting
+        gray = cv2.adaptiveThreshold(
+            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
+        )
+        
+        # Denoise
+        gray = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
+        
+        # Convert back to PIL Image
+        image = Image.fromarray(gray)
+        
+        # Convert back to RGB (3 channels) for model compatibility
+        image = image.convert('RGB')
+        
         # Enhance contrast
         enhancer = ImageEnhance.Contrast(image)
-        image = enhancer.enhance(1.5)
+        image = enhancer.enhance(2.0)  # Increased from 1.5
         
         # Enhance sharpness
         enhancer = ImageEnhance.Sharpness(image)
-        image = enhancer.enhance(1.2)
+        image = enhancer.enhance(2.0)  # Increased from 1.2
+        
+        # Apply unsharp mask for better edge detection
+        image = image.filter(ImageFilter.UnsharpMask(radius=2, percent=150, threshold=3))
         
         return image
     
@@ -103,10 +134,12 @@ class DonutReceiptScanner:
                     pad_token_id=self.processor.tokenizer.pad_token_id,
                     eos_token_id=self.processor.tokenizer.eos_token_id,
                     use_cache=True,
-                    num_beams=2,  # Increased for better accuracy
+                    num_beams=5,  # Increased for better accuracy
                     bad_words_ids=[[self.processor.tokenizer.unk_token_id]],
                     return_dict_in_generate=True,
                     output_scores=True,
+                    length_penalty=1.0,
+                    repetition_penalty=1.2,
                 )
             
             # Decode output
@@ -174,15 +207,24 @@ class DonutReceiptScanner:
     
     def extract_store_name(self, result: Dict) -> str:
         """
-        Extract store name from various possible fields
+        Extract store name from various possible fields with better validation
         """
-        store_fields = ["company", "store", "shop", "vendor", "merchant"]
+        store_fields = ["company", "store", "shop", "vendor", "merchant", "name", "seller"]
         
         for field in store_fields:
             if field in result and result[field]:
                 store_name = str(result[field]).strip()
-                if store_name and store_name != "N/A":
-                    return store_name
+                # Filter out common false positives
+                if (store_name and 
+                    store_name != "N/A" and 
+                    len(store_name) > 1 and 
+                    not re.match(r'^\d+$', store_name) and  # Not just numbers
+                    not re.match(r'^[\d/:-]+$', store_name)):  # Not date/time format
+                    # Clean up common OCR errors
+                    store_name = re.sub(r'[^a-zA-Z0-9\s&.-]', '', store_name)
+                    store_name = ' '.join(store_name.split())  # Normalize whitespace
+                    if len(store_name) > 2:
+                        return store_name
         
         return "Unknown Store"
     
@@ -221,23 +263,67 @@ class DonutReceiptScanner:
     
     def clean_amount(self, amount: str) -> str:
         """
-        Clean and format amount strings
+        Clean and format amount strings with validation to prevent time concatenation
         """
         if not amount or amount == "N/A":
             return "0.00"
         
-        # Remove currency symbols and extra spaces
-        amount = re.sub(r'[^\d.]', '', str(amount))
+        # Convert to string and remove whitespace
+        amount = str(amount).strip()
+        
+        # Remove currency symbols but keep digits, dots, and commas
+        amount = re.sub(r'[^\d.,]', '', amount)
+        
+        # Remove commas (thousand separators)
+        amount = amount.replace(',', '')
+        
+        # Handle multiple dots (keep only the last one as decimal point)
+        if amount.count('.') > 1:
+            parts = amount.split('.')
+            amount = ''.join(parts[:-1]) + '.' + parts[-1]
+        
+        # Validate: if no digits, return 0.00
+        if not re.search(r'\d', amount):
+            return "0.00"
+        
+        # Check for suspiciously long numbers (likely concatenated with time/date)
+        # Valid amounts typically don't exceed 8 digits before decimal
+        if '.' in amount:
+            integer_part = amount.split('.')[0]
+            if len(integer_part) > 8:
+                # Likely concatenated - try to extract reasonable amount
+                # Look for patterns like XXX06:56 becoming XXX0656
+                # Common pattern: time format digits (00-59:00-59) at the end
+                match = re.search(r'^(\d+?)([0-5]\d[0-5]\d)$', integer_part)
+                if match:
+                    amount = match.group(1)  # Take the part before time digits
+                    logger.warning(f"Detected time concatenation, extracted: {amount}")
+                else:
+                    # If no pattern match, take first reasonable digits
+                    amount = integer_part[:6]  # Limit to 6 digits max
+        else:
+            # No decimal point
+            if len(amount) > 8:
+                # Check for time pattern at end
+                match = re.search(r'^(\d+?)([0-5]\d[0-5]\d)$', amount)
+                if match:
+                    amount = match.group(1)
+                    logger.warning(f"Detected time concatenation, extracted: {amount}")
+                else:
+                    amount = amount[:6]
         
         # Ensure proper decimal format
-        if '.' in amount:
-            parts = amount.split('.')
-            if len(parts) == 2:
-                integer_part = parts[0]
-                decimal_part = parts[1][:2].ljust(2, '0')
-                amount = f"{integer_part}.{decimal_part}"
-        else:
-            amount = f"{amount}.00"
+        try:
+            amount_float = float(amount) if '.' in amount else float(amount)
+            # Sanity check: amounts over 1,000,000 are suspicious
+            if amount_float > 1000000:
+                logger.warning(f"Suspiciously large amount: {amount_float}, capping at 999999.99")
+                amount_float = 999999.99
+            # Format to 2 decimal places
+            amount = f"{amount_float:.2f}"
+        except ValueError:
+            logger.error(f"Could not parse amount: {amount}")
+            return "0.00"
         
         return amount
     
@@ -319,7 +405,7 @@ class DonutReceiptScanner:
 class ReceiptScanner:
     """High-level scanner for FastAPI.
     
-    Attempts Tesseract OCR first (faster, lighter), then Donut AI as fallback.
+    Uses Donut AI model with EasyOCR fallback for accurate receipt scanning.
     Returns: dict with total_amount, vendor, raw_text, items
     """
     @staticmethod
@@ -332,73 +418,123 @@ class ReceiptScanner:
             logger.error(f"Failed to open image: {e}")
             return {"total_amount": 0.0, "vendor": "Error", "raw_text": "", "error": str(e)}
 
-        # Try Tesseract first (faster, no GPU needed)
-        try:
-            ocr_text = pytesseract.image_to_string(img)
-            
-            # Extract amounts using regex
-            amount_patterns = [
-                r"total[:\s]*\$?([\d,]+\.\d{2})",  # Total: $123.45
-                r"amount[:\s]*\$?([\d,]+\.\d{2})",  # Amount: $123.45
-                r"\$([\d,]+\.\d{2})",               # $123.45
-                r"([\d,]+\.\d{2})"                  # 123.45
-            ]
-            
-            amounts = []
-            text_lower = ocr_text.lower()
-            for pattern in amount_patterns:
-                matches = re.findall(pattern, text_lower, re.IGNORECASE)
-                for match in matches:
-                    try:
-                        clean_amt = float(match.replace(',', ''))
-                        if clean_amt > 0:
-                            amounts.append(clean_amt)
-                    except:
-                        pass
-            
-            total_amount = max(amounts) if amounts else 0.0
-            
-            # Extract vendor (first non-empty line)
-            vendor = "Unknown"
-            for line in ocr_text.splitlines():
-                line = line.strip()
-                if line and len(line) > 2:
-                    vendor = line[:50]  # Limit length
-                    break
-            
-            if total_amount > 0:
-                logger.info(f"Tesseract OCR: ${total_amount} from {vendor}")
-                return {
-                    "total_amount": total_amount,
-                    "vendor": vendor,
-                    "raw_text": ocr_text,
-                    "items": [],
-                    "method": "tesseract"
-                }
-        except Exception as e:
-            logger.warning(f"Tesseract failed: {e}. Trying Donut AI...")
-
-        # Fallback to Donut AI (slower but more accurate)
+        # Try Donut AI first
+        donut_result = None
         try:
             donut = DonutReceiptScanner()
-            result = donut.extract_receipt_from_pil(img)
+            donut_result = donut.extract_receipt_from_pil(img)
             
-            total = result.get("total_amount", "0")
+            total_str = donut_result.get("total_amount", "0")
+            vendor = donut_result.get("store_name", "Unknown")
+            
+            # Parse total amount
             try:
-                total_val = float(re.sub(r"[^0-9.]", "", str(total)) or 0)
+                total_val = float(total_str)
             except:
                 total_val = 0.0
             
-            logger.info(f"Donut AI: ${total_val} from {result.get('store_name', 'Unknown')}")
+            # If Donut failed to extract meaningful data, try EasyOCR
+            if (total_val == 0.0 or vendor == "Unknown Store") and EASYOCR_AVAILABLE:
+                logger.info("Donut extraction incomplete, trying EasyOCR...")
+                ocr_result = ReceiptScanner._extract_with_easyocr(img)
+                
+                # Use EasyOCR data if better
+                if ocr_result["total_amount"] > 0 and total_val == 0:
+                    total_val = ocr_result["total_amount"]
+                    logger.info(f"Using EasyOCR total: {total_val}")
+                if ocr_result["vendor"] != "Unknown" and vendor == "Unknown Store":
+                    vendor = ocr_result["vendor"]
+                    logger.info(f"Using EasyOCR vendor: {vendor}")
+            
+            logger.info(f"Final result: ${total_val} from {vendor}")
             return {
                 "total_amount": total_val,
-                "vendor": result.get("store_name", "Unknown"),
-                "raw_text": json.dumps(result.get("raw_result", {})),
-                "items": result.get("items", []),
-                "method": "donut"
+                "vendor": vendor,
+                "raw_text": json.dumps(donut_result.get("raw_result", {})),
+                "items": donut_result.get("items", []),
+                "date": donut_result.get("date", "Unknown"),
+                "method": "donut+ocr" if EASYOCR_AVAILABLE else "donut"
             }
         except Exception as e:
-            logger.error(f"Both OCR methods failed: {e}")
+            logger.error(f"Receipt scanning failed: {e}")
+            # Try EasyOCR as complete fallback
+            if EASYOCR_AVAILABLE:
+                try:
+                    logger.info("Donut failed, using EasyOCR fallback")
+                    return ReceiptScanner._extract_with_easyocr(img)
+                except:
+                    pass
+            return {
+                "total_amount": 0.0,
+                "vendor": "Unknown",
+                "raw_text": "",
+                "items": [],
+                "error": str(e)
+            }
+    
+    @staticmethod
+    def _extract_with_easyocr(img: Image.Image) -> Dict:
+        """
+        Fallback extraction using EasyOCR for better accuracy
+        """
+        try:
+            # Initialize EasyOCR reader (supports English and Hindi for Indian receipts)
+            reader = easyocr.Reader(['en', 'hi'], gpu=torch.cuda.is_available())
+            
+            # Convert PIL to numpy array
+            img_array = np.array(img)
+            
+            # Perform OCR
+            results = reader.readtext(img_array)
+            
+            # Extract text
+            all_text = [text for (bbox, text, prob) in results]
+            raw_text = ' '.join(all_text)
+            
+            # Find total amount - look for common patterns
+            total_amount = 0.0
+            total_patterns = [
+                r'total[:\s]+(?:rs\.?|₹)?\s*([\d,]+\.?\d*)',
+                r'grand\s+total[:\s]+(?:rs\.?|₹)?\s*([\d,]+\.?\d*)',
+                r'amount[:\s]+(?:rs\.?|₹)?\s*([\d,]+\.?\d*)',
+                r'₹\s*([\d,]+\.?\d*)\s*$',  # Currency at start of line
+                r'rs\.?\s*([\d,]+\.?\d*)\s*$',  # Rs. at start
+            ]
+            
+            for pattern in total_patterns:
+                match = re.search(pattern, raw_text.lower())
+                if match:
+                    try:
+                        amount_str = match.group(1).replace(',', '')
+                        total_amount = float(amount_str)
+                        if total_amount > 0:
+                            logger.info(f"Found total with pattern: {pattern} = {total_amount}")
+                            break
+                    except:
+                        continue
+            
+            # Find vendor name - usually first few lines, all caps or title case
+            vendor = "Unknown"
+            for i, (bbox, text, prob) in enumerate(results[:5]):  # Check first 5 lines
+                text = text.strip()
+                # Vendor names are usually longer than 3 chars, not just numbers
+                if (len(text) > 3 and 
+                    not re.match(r'^[\d/:-]+$', text) and
+                    prob > 0.5):  # Confidence threshold
+                    vendor = text
+                    logger.info(f"Found vendor: {vendor}")
+                    break
+            
+            return {
+                "total_amount": total_amount,
+                "vendor": vendor,
+                "raw_text": raw_text,
+                "items": [],
+                "date": "Unknown",
+                "method": "easyocr"
+            }
+        except Exception as e:
+            logger.error(f"EasyOCR extraction failed: {e}")
             return {
                 "total_amount": 0.0,
                 "vendor": "Unknown",
